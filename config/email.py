@@ -42,6 +42,22 @@ OUTLOOK_FETCH_MODE = "auto"
 # 取邮件 API 的根 URL（远端模式使用）
 OUTLOOK_API_BASE = "https://mail.chatai.codes"
 
+# ============================================================
+# outlook-email-plus 外部池 API（优先取码通道）
+# ============================================================
+# 开启后，取 OTP 时先问 outlook-email-plus，由它用自己的凭据读信；
+# 失败再回退 Graph/IMAP 直连。用于应对本地池凭据过期的情况。
+OEPLUS_API_ENABLED = True
+OEPLUS_API_BASE = "http://127.0.0.1:5810"
+OEPLUS_API_KEY = "oeplus-local-5810"
+# 取近多少分钟内的邮件（注册流程一般很短，给足冗余）
+OEPLUS_SINCE_MINUTES = 60
+# 检索的邮件文件夹，逗号分隔。OpenAI 验证码有时被判为垃圾邮件，
+# 默认同时查收件箱和垃圾箱；可选值：inbox / junkemail / deleteditems
+OEPLUS_FOLDERS = "inbox,junkemail"
+# 单次请求超时
+OEPLUS_TIMEOUT = 20
+
 
 # ============================================================
 # OTP 轮询参数
@@ -186,4 +202,4 @@ REMAIL_ORDER_WAIT_SECONDS = 30
 REMAIL_REQUEST_TIMEOUT = 20
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'OTP_SETTLE_SECONDS': 'int', 'GENERIC_API_PROXY': 'str', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'OTP_SETTLE_SECONDS': 'int', 'GENERIC_API_PROXY': 'str', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'OEPLUS_API_ENABLED': 'bool', 'OEPLUS_API_BASE': 'str', 'OEPLUS_API_KEY': 'str', 'OEPLUS_SINCE_MINUTES': 'int', 'OEPLUS_FOLDERS': 'str', 'OEPLUS_TIMEOUT': 'int', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})

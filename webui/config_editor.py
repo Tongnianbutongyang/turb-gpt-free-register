@@ -55,6 +55,31 @@ EDITABLE_FIELDS = [
         "key": "AUTO_PLAN_CHECK_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
         "label": "注册后自动查套餐", "help": "注册成功后自动入队查询套餐/Plus 资格；关闭后仅保存账号，不自动查套餐",
     },
+    {
+        "key": "CHATGPT2API_AUTO_EXPORT", "file": "chatgpt2api.py", "type": "bool", "group": "chatgpt2api",
+        "label": "注册后自动注入 chatgpt2api", "help": "注册成功保存网页 AT 后，自动 POST 到 chatgpt2api /api/accounts",
+    },
+    {
+        "key": "CHATGPT2API_API_BASE", "file": "chatgpt2api.py", "type": "str", "group": "chatgpt2api",
+        "label": "chatgpt2api 地址", "help": "例如 http://127.0.0.1:3030",
+    },
+    {
+        "key": "CHATGPT2API_AUTH_KEY", "file": "chatgpt2api.py", "type": "str", "group": "chatgpt2api",
+        "label": "chatgpt2api 密钥", "help": "对应 chatgpt2api 的 auth-key；请求头 Authorization: Bearer",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "CHATGPT2API_API_TIMEOUT", "file": "chatgpt2api.py", "type": "int", "group": "chatgpt2api",
+        "label": "chatgpt2api 超时", "help": "导入后会刷新账号，建议 120-180 秒",
+    },
+    {
+        "key": "CHATGPT2API_REWRITE_LOOPBACK_PROXY", "file": "chatgpt2api.py", "type": "bool", "group": "chatgpt2api",
+        "label": "改写环回代理", "help": "把 127.0.0.1/localhost 代理改成 host.docker.internal，供 Docker 内 chatgpt2api 使用",
+    },
+    {
+        "key": "CHATGPT2API_ACCOUNT_PROXY", "file": "chatgpt2api.py", "type": "str", "group": "chatgpt2api",
+        "label": "chatgpt2api 账号代理", "help": "留空则用注册时实际代理；填写则强制覆盖，例如 socks5h://host.docker.internal:10808",
+    },
 
     # ---- CloakBrowser ----
     {

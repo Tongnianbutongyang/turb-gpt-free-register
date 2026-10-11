@@ -89,3 +89,6 @@ webui.log
 webui.pid
 logs/
 run/
+
+# WebUI runtime lock
+*.lock

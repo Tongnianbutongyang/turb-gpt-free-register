@@ -13,7 +13,10 @@ CLOAK_GEOIP: bool = True
 
 # 显式指定 Cloak 语言/时区；留空则在 CLOAK_GEOIP=True 时按出口 IP 自动推断。
 # 例如：CLOAK_LOCALE="ja-JP"，CLOAK_TIMEZONE="Asia/Tokyo"。
-CLOAK_LOCALE: str = ""
+# 注意：locale 留空时页面语言跟随出口 IP（波兰 IP → 波兰语界面），
+# 而注册机按英文文案找按钮，非英文界面会一路找不到元素。
+# 因此这里固定 en-US，时区仍由 geoip 跟随出口 IP。
+CLOAK_LOCALE: str = "en-US"
 CLOAK_TIMEZONE: str = ""
 
 # 是否把本项目传入/代理池抽取的代理传给 CloakBrowser。

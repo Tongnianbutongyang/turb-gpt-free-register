@@ -89,16 +89,28 @@ logger = _CodexLogger(_base_logger)
 
 
 def _is_callback_url(url: str) -> bool:
+    """判断浏览器当前 URL 是否为 OAuth callback。
+
+    兼容两种 client：
+      - Codex CLI client  -> http://localhost:1455/auth/callback
+      - Platform client   -> https://platform.openai.com/auth/callback
+    都以 /auth/callback 结尾，按 host 分别放行。
+    """
     try:
         parsed = urlparse(url)
     except Exception:
         return False
-    return (
-        parsed.scheme in ("http", "https")
-        and parsed.hostname in ("localhost", "127.0.0.1")
-        and parsed.port == 1455
-        and parsed.path == "/auth/callback"
-    )
+    if parsed.scheme not in ("http", "https"):
+        return False
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/auth/callback"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1") and parsed.port == 1455:
+        return True
+    if host in ("platform.openai.com", "chatgpt.com", "auth.openai.com"):
+        return True
+    return False
 
 
 def _extract_callback_url_from_page(driver) -> str:

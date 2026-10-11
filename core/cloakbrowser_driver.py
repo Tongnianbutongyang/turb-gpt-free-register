@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import cloakbrowser as _cfg
+from core.playwright_runtime import ensure_playwright_tempdir
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,36 @@ class CloakElement:
             try:
                 return self.locator.evaluate(expression, arg, timeout=3000)
             except TypeError:
-                return self.locator.evaluate(expression, arg)
-        return self.handle.evaluate(expression, arg)
+                old = 90000
+                try:
+                    self.page.set_default_timeout(3000)
+                    return self.locator.evaluate(expression, arg)
+                finally:
+                    try:
+                        self.page.set_default_timeout(old)
+                    except Exception:
+                        pass
+        old = 90000
+        try:
+            self.page.set_default_timeout(3000)
+            return self.handle.evaluate(expression, arg)
+        finally:
+            try:
+                self.page.set_default_timeout(old)
+            except Exception:
+                pass
 
     def _eval_handle(self, expression: str, arg: Any = None) -> Any:
         h = self._handle()
-        return h.evaluate_handle(expression, arg)
+        old = 90000
+        try:
+            self.page.set_default_timeout(3000)
+            return h.evaluate_handle(expression, arg)
+        finally:
+            try:
+                self.page.set_default_timeout(old)
+            except Exception:
+                pass
 
     def is_displayed(self) -> bool:
         try:
@@ -59,21 +84,67 @@ class CloakElement:
             return False
 
     def click(self) -> None:
+        try:
+            if self.locator is not None:
+                self.locator.click(timeout=3000, force=True)
+            else:
+                self.handle.click(timeout=3000, force=True)
+        except Exception:
+            try:
+                if self.locator is not None:
+                    self.locator.evaluate("el => el.click()")
+                elif self.handle is not None:
+                    self.handle.evaluate("el => el.click()")
+            except Exception:
+                pass
+
+    def _set_input_value(self, value: str) -> None:
+        script = """(el, value) => {
+          if (!el) return false;
+          const tag = String(el.tagName || '').toLowerCase();
+          try { el.focus(); } catch (e) {}
+          const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, value);
+          else el.value = value;
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+          el.dispatchEvent(new Event('change', {bubbles:true}));
+          return String(el.value || '');
+        }"""
         if self.locator is not None:
-            self.locator.click(timeout=10000)
+            try:
+                self.locator.evaluate(script, value, timeout=3000)
+            except TypeError:
+                old = 90000
+                try:
+                    self.page.set_default_timeout(3000)
+                    self.locator.evaluate(script, value)
+                finally:
+                    try:
+                        self.page.set_default_timeout(old)
+                    except Exception:
+                        pass
+        elif self.handle is not None:
+            old = 90000
+            try:
+                self.page.set_default_timeout(3000)
+                self.handle.evaluate(script, value)
+            finally:
+                try:
+                    self.page.set_default_timeout(old)
+                except Exception:
+                    pass
         else:
-            self.handle.click(timeout=10000)
+            raise RuntimeError("CloakElement has no locator/handle")
 
     def clear(self) -> None:
         try:
-            if self.locator is not None:
-                self.locator.fill("", timeout=10000)
-            else:
-                self.handle.fill("", timeout=10000)
+            self._set_input_value("")
         except Exception:
-            # 部分非 input 元素不支持 fill，回退键盘清空。
-            self.click()
-            self.page.keyboard.press("Meta+A")
+            try:
+                self.page.keyboard.press("Control+A")
+            except Exception:
+                self.page.keyboard.press("Meta+A")
             self.page.keyboard.press("Backspace")
 
     @property
@@ -83,28 +154,52 @@ class CloakElement:
         except Exception:
             return ""
 
+    @property
+    def text(self) -> str:
+        try:
+            return str(self._eval("el => (el.innerText || el.textContent || '').trim()") or "")
+        except Exception:
+            return ""
+
     def send_keys(self, *values: str) -> None:
-        # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
-        text = "".join(str(v or "") for v in values)
-        lower = text.lower()
-        try:
-            self.click()
-        except Exception:
-            pass
-        if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:
-            # Selenium Keys.CONTROL/COMMAND 编码可能传入私有区字符；这里按全选处理。
+        # 兼容 Selenium 逐字输入。不要 click：人工化路径会按 1～2 个字符调用，
+        # 每次 click 都会把光标点进输入框中间，邮箱被插成乱码。
+        # 也不要用 locator.fill()：同样会把整框覆盖成当前这一小段。
+        special = {
+            "\ue003": "Backspace",
+            "\ue017": "Delete",
+            "\ue006": "Enter",
+            "\ue007": "Enter",
+            "\ue004": "Tab",
+            "\ue00c": "Escape",
+        }
+        for raw in values:
+            text = str(raw or "")
+            if not text:
+                continue
+            if "\ue03d" in text or "\ue009" in text:
+                try:
+                    self.page.keyboard.press("Control+A")
+                except Exception:
+                    self.page.keyboard.press("Meta+A")
+                leftover = text.replace("\ue03d", "").replace("\ue009", "")
+                if leftover.lower() == "a" or leftover == "":
+                    continue
+                text = leftover
+            if text in special:
+                self.page.keyboard.press(special[text])
+                continue
+            # 不要 locator.fill()：无头 ChatGPT 登录页上会卡死可操作性等待。
+            if len(text) >= 3:
+                try:
+                    self._set_input_value(text)
+                    continue
+                except Exception:
+                    pass
             try:
-                self.page.keyboard.press("Meta+A")
+                self.page.keyboard.insert_text(text)
             except Exception:
-                self.page.keyboard.press("Control+A")
-            return
-        try:
-            if self.locator is not None:
-                self.locator.fill(text, timeout=10000)
-            else:
-                self.handle.fill(text, timeout=10000)
-        except Exception:
-            self.page.keyboard.type(text, delay=35)
+                self.page.keyboard.type(text, delay=10)
 
     def get_attribute(self, name: str) -> str | None:
         try:
@@ -303,21 +398,156 @@ class CloakSeleniumDriver:
                 raise TimeoutError("execute_async_script timeout")
             return result
 
-        # Selenium 脚本经常以 `return ...` 为主体；用 Function 保持语义。
-        wrapper = """({script, args}) => {
-          const fn = new Function(...args.map((_, i) => 'a' + i), script);
-          return fn(...args);
+        # Selenium 脚本把第一个参数当 DOM 节点，并用 arguments[0]。
+        # Playwright locator.evaluate 的第一个形参才是元素；payload 必须是第二个。
+        # JSON 结果走 evaluate（可超时）；真正返回 DOM 节点时再 evaluate_handle。
+        payload = {"script": script, "args": serial_args}
+        inspect_wrapper = """(extra) => {
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, extra.args || []);
+          if (result && result.nodeType === 1) return {kind:'el'};
+          if (result && typeof result === 'object') {
+            const elKeys = Object.keys(result).filter(k => result[k] && result[k].nodeType === 1);
+            if (elKeys.length) return {kind:'mixed', elKeys};
+          }
+          return {kind:'json', value: result};
         }"""
-        element_wrapper = """(el, payload) => {
-          const args = [el, ...payload.args];
-          const fn = new Function(...args.map((_, i) => 'a' + i), payload.script);
-          return fn(...args);
+        inspect_element_wrapper = """(element, extra) => {
+          const args = [element, ...(extra && extra.args ? extra.args : [])];
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, args);
+          if (result && result.nodeType === 1) return {kind:'el'};
+          if (result && typeof result === 'object') {
+            const elKeys = Object.keys(result).filter(k => result[k] && result[k].nodeType === 1);
+            if (elKeys.length) return {kind:'mixed', elKeys};
+          }
+          return {kind:'json', value: result};
+        }"""
+        element_wrapper = """(element, extra) => {
+          const args = [element, ...(extra && extra.args ? extra.args : [])];
+          const fn = new Function(extra.script);
+          return fn.apply(null, args);
+        }"""
+        wrapper = """(extra) => {
+          const fn = new Function(extra.script);
+          return fn.apply(null, extra.args || []);
         }"""
         if first_el is not None:
-            handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
+            try:
+                inspected = first_el._eval(inspect_element_wrapper, payload)
+            except Exception as exc:
+                msg = str(exc)
+                if "Execution context was destroyed" in msg or "navigation" in msg.lower() or "Timeout" in msg:
+                    logger.info("[Cloak] 元素脚本 inspect 跳转/超时：%s", msg[:160])
+                    return {"ok": True, "reason": "navigation_or_timeout"}
+                raise
+            return self._materialize_inspected(inspected, payload, first_el=first_el, element_wrapper=element_wrapper, wrapper=wrapper)
+        inspected = self._eval_json(inspect_wrapper, payload)
+        return self._materialize_inspected(inspected, payload, first_el=None, element_wrapper=element_wrapper, wrapper=wrapper)
+
+    def _materialize_inspected(self, inspected: Any, payload: dict, *, first_el: Any, element_wrapper: str, wrapper: str) -> Any:
+        if isinstance(inspected, dict) and inspected.get("kind") == "json":
+            return inspected.get("value")
+        if isinstance(inspected, dict) and inspected.get("kind") == "el":
+            if first_el is not None:
+                handle = first_el._eval_handle(element_wrapper, payload)
+            else:
+                handle = self._eval_handle_with_timeout(wrapper, payload)
+            return self._unwrap_js_result(self.page, handle)
+        if isinstance(inspected, dict) and inspected.get("kind") == "mixed":
+            return self._materialize_mixed(payload, inspected.get("elKeys") or [], first_el=first_el, element_wrapper=element_wrapper)
+        return inspected
+
+    def _materialize_mixed(self, payload: dict, el_keys: list[Any], *, first_el: Any, element_wrapper: str) -> dict:
+        json_extract = """(extra) => {
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, extra.args || []);
+          const out = {};
+          for (const k of Object.keys(result || {})) {
+            if (!(result[k] && result[k].nodeType === 1)) out[k] = result[k];
+          }
+          return out;
+        }"""
+        el_extract = """(extra) => {
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, extra.args || []);
+          return result ? result[extra.key] : null;
+        }"""
+        el_extract_from_element = """(element, extra) => {
+          const args = [element, ...(extra && extra.args ? extra.args : [])];
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, args);
+          return result ? result[extra.key] : null;
+        }"""
+        json_extract_from_element = """(element, extra) => {
+          const args = [element, ...(extra && extra.args ? extra.args : [])];
+          const fn = new Function(extra.script);
+          const result = fn.apply(null, args);
+          const out = {};
+          for (const k of Object.keys(result || {})) {
+            if (!(result[k] && result[k].nodeType === 1)) out[k] = result[k];
+          }
+          return out;
+        }"""
+        if first_el is not None:
+            out = first_el._eval(json_extract_from_element, payload) or {}
         else:
-            handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
-        return self._unwrap_js_result(self.page, handle)
+            out = self._eval_json(json_extract, payload) or {}
+        if not isinstance(out, dict):
+            out = {"ok": True, "value": out}
+        for key in el_keys:
+            extra = dict(payload)
+            extra["key"] = key
+            try:
+                if first_el is not None:
+                    handle = first_el._eval_handle(el_extract_from_element, extra)
+                else:
+                    handle = self._eval_handle_with_timeout(el_extract, extra)
+                out[key] = self._unwrap_js_result(self.page, handle)
+            except Exception as exc:
+                logger.info("[Cloak] mixed 元素提取失败 key=%s err=%s", key, str(exc)[:160])
+                out[key] = None
+        return out
+
+    def _eval_json(self, expression: str, arg: Any) -> Any:
+        try:
+            return self.page.evaluate(expression, arg, timeout=5000)
+        except TypeError:
+            old = getattr(self, "_page_load_timeout_ms", 90000)
+            try:
+                self.page.set_default_timeout(5000)
+                return self.page.evaluate(expression, arg)
+            finally:
+                try:
+                    self.page.set_default_timeout(old)
+                except Exception:
+                    pass
+        except Exception as exc:
+            msg = str(exc)
+            if "Execution context was destroyed" in msg or "navigation" in msg.lower() or "Timeout" in msg:
+                logger.info("[Cloak] JS evaluate 在跳转/超时后放弃：%s", msg[:160])
+                return {"ok": True, "reason": "navigation_or_timeout"}
+            raise
+
+    def _eval_handle_with_timeout(self, expression: str, arg: Any) -> Any:
+        old = getattr(self, "_page_load_timeout_ms", 90000)
+        try:
+            self.page.set_default_timeout(5000)
+        except Exception:
+            pass
+        try:
+            return self.page.evaluate_handle(expression, arg)
+        except Exception as exc:
+            msg = str(exc)
+            if "Execution context was destroyed" in msg or "navigation" in msg.lower() or "Timeout" in msg:
+                logger.info("[Cloak] JS evaluate_handle 在跳转/超时后放弃：%s", msg[:160])
+                return type("EmptyHandle", (), {"as_element": lambda self: None, "json_value": lambda self: {"ok": True, "reason": "navigation_or_timeout"}, "dispose": lambda self: None})()
+            raise
+        finally:
+            try:
+                self.page.set_default_timeout(old)
+            except Exception:
+                pass
 
 
 def _normalize_proxy(proxy: str | None) -> str | None:
@@ -418,6 +648,8 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
         raise RuntimeError("未安装 cloakbrowser，请执行：pip install cloakbrowser") from exc
+    tmp_dir = ensure_playwright_tempdir()
+    logger.info("[Cloak] Playwright 临时目录：%s", tmp_dir)
 
     launch_args = list(getattr(_cfg, "CLOAK_EXTRA_ARGS", []) or [])
     seed = str(getattr(_cfg, "CLOAK_FINGERPRINT_SEED", "") or "").strip()

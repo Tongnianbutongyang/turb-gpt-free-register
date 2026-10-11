@@ -162,12 +162,15 @@ def run_cloak_registration(
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
-        # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
-        post_register_dwell(email, label="Cloak注册")
-        if traffic_tracker is not None:
-            network_traffic = traffic_tracker.stop()
-        if data_saver is not None:
-            data_saver.stop()
+        extra = {
+            "user": session_info.get("user"),
+            "account": session_info.get("account"),
+            "expires": session_info.get("expires"),
+            "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+            "registration_password": openai_password,
+            "codex": codex_result,
+        }
+        # 先落库，避免后续流量统计/关浏览器卡住导致成功号丢失。
         account_id = save_account_data(
             email=email,
             access_token=access_token,
@@ -175,16 +178,19 @@ def run_cloak_registration(
             email_source=resolve_email_source(email),
             proxy_used=((opened.raw or {}).get("proxy_pool_target") if opened else None) or proxy or None,
             batch_dir=batch_dir,
-            extra={
-                "user": session_info.get("user"),
-                "account": session_info.get("account"),
-                "expires": session_info.get("expires"),
-                "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
-                "registration_password": openai_password,
-                "codex": codex_result,
-                "network_traffic": network_traffic,
-            },
+            extra=extra,
+            auto_plan_check=False,
         )
+        logger.info("[Cloak注册] 账号已先落库：id=%s email=%s", account_id, email)
+
+        post_register_dwell(email, label="Cloak注册")
+        if traffic_tracker is not None:
+            try:
+                network_traffic = traffic_tracker.stop()
+            except Exception as exc:
+                logger.warning("[Cloak注册] 流量统计失败，跳过：%s", exc)
+        if data_saver is not None:
+            data_saver.stop()
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {
             "success": bool(codex_ok),

@@ -10,6 +10,10 @@ WebUI 启动入口。
 
 与 CLI（python main.py）完全平行，互不影响。
 """
+from core.playwright_runtime import ensure_playwright_tempdir
+
+ensure_playwright_tempdir()
+
 import argparse
 import logging
 import os

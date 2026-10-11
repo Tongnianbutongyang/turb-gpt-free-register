@@ -916,6 +916,9 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             sizes = request.sizes()
         except Exception:
             return None
+        # 某些未完成请求 sizes() 会一直挂住，外层 stop() 必须能跳过。
+        if sizes is None:
+            return None
         return {
             name: _optional_size(_size_field(sizes, name))
             for name in (
@@ -1126,15 +1129,11 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 )
                 continue
 
-            values = self._request_size_values(request) or {}
-            if values:
-                upload = (values.get("requestBodySize") or 0) + (values.get("requestHeadersSize") or 0)
-                download = (values.get("responseBodySize") or 0) + (values.get("responseHeadersSize") or 0)
-                include_response = True
-            else:
-                upload = self._request_fallback_upload(request)
-                download = 0
-                include_response = False
+            # 未完成请求上 Request.sizes() 会同步卡死 Playwright。
+            values: dict[str, int | None] = {}
+            upload = self._request_fallback_upload(request)
+            download = 0
+            include_response = False
             self._record_playwright_detail(
                 request,
                 request_id=key,

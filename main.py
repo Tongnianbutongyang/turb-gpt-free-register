@@ -3,6 +3,10 @@
 ChatGPT 协议注册全流程入口
 串联 12 个步骤，自动完成 ChatGPT 账号注册
 """
+from core.playwright_runtime import ensure_playwright_tempdir
+
+ensure_playwright_tempdir()
+
 import sys
 import argparse
 import logging

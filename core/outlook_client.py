@@ -59,6 +59,8 @@ _CONTEXT_CACHE: dict[str, "OutlookAccount"] = {}
 _REMOTE_DISABLED = False
 _MS_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 _MS_TOKEN_FATAL_CACHE: dict[str, tuple[str, float]] = {}
+# 最近一次取码命中的邮件元信息（email/otp/subject/ts），供注册流程判断主题类型。
+_LAST_OTP_META: dict[str, object] = {}
 
 
 @dataclass
@@ -557,6 +559,26 @@ def _ms_access_token(
         attempts = [
             (
                 "graph",
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                {
+                    "client_id": account.client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": account.refresh_token,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            ),
+            (
+                "graph",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                {
+                    "client_id": account.client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": account.refresh_token,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            ),
+            (
+                "graph",
                 "https://login.microsoftonline.com/common/oauth2/v2.0/token",
                 {
                     "client_id": account.client_id,
@@ -697,29 +719,54 @@ def _normalize_ms_message(m: dict) -> dict:
 
 
 def _fetch_graph_messages(http: CurlSession, token: str) -> list[dict]:
+    """读取 Graph 邮件。遍历配置的文件夹（默认收件箱 + 垃圾箱），合并去重。"""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
         "Prefer": 'outlook.body-content-type="html"',
     }
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
     params = {
         "$top": "20",
         "$orderby": "receivedDateTime desc",
         "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
     }
-    resp = http.get(url, headers=headers, params=params)
-    text = resp.text or ""
-    if resp.status_code != 200:
-        raise OutlookClientError(f"Microsoft Graph messages HTTP {resp.status_code}: {text[:500]}")
-    data = resp.json()
-    rows = data.get("value") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
-        raise OutlookClientError(f"Microsoft Graph 响应缺少 value: {str(data)[:300]}")
-    out = [_normalize_ms_message(m) for m in rows if isinstance(m, dict)]
-    for item in out:
-        item["_fetch_source"] = "graph"
+
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    errors: list[str] = []
+    for folder in _oeplus_folders() or ["inbox"]:
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages"
+        try:
+            resp = http.get(url, headers=headers, params=params)
+        except Exception as exc:
+            errors.append(f"{folder}: {type(exc).__name__}: {str(exc)[:120]}")
+            continue
+        text = resp.text or ""
+        if resp.status_code != 200:
+            errors.append(f"{folder}: HTTP {resp.status_code}: {text[:200]}")
+            continue
+        data = resp.json()
+        rows = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            errors.append(f"{folder}: 响应缺少 value: {str(data)[:160]}")
+            continue
+        for m in rows:
+            if not isinstance(m, dict):
+                continue
+            mail_id = str(m.get("id") or "")
+            dedup_key = mail_id or f"{m.get('receivedDateTime')}|{str(m.get('subject') or '')[:60]}"
+            if dedup_key in seen_ids:
+                continue
+            seen_ids.add(dedup_key)
+            item = _normalize_ms_message(m)
+            item["_fetch_source"] = "graph"
+            item["_fetch_folder"] = folder
+            out.append(item)
+
+    # 全部文件夹都失败才算失败；部分失败时仍返回已取到的邮件
+    if not out and errors:
+        raise OutlookClientError(f"Microsoft Graph messages 全部失败: {'; '.join(errors)[:400]}")
     return out
 
 
@@ -729,7 +776,7 @@ def _fetch_outlook_rest_messages(http: CurlSession, token: str) -> list[dict]:
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
-    url = "https://outlook.office.com/api/v2.0/me/mailfolders/inbox/messages"
+    base_url = "https://outlook.office.com/api/v2.0/me/mailfolders/{folder}/messages"
     attempts = [
         {
             "$top": "20",
@@ -743,56 +790,90 @@ def _fetch_outlook_rest_messages(http: CurlSession, token: str) -> list[dict]:
         },
         {"$top": "20"},
     ]
-    last_text = ""
-    data = None
-    for params in attempts:
-        resp = http.get(url, headers=headers, params=params)
-        text = resp.text or ""
-        last_text = text[:500]
-        if resp.status_code == 200:
-            data = resp.json()
+
+    out: list[dict] = []
+    seen_ids: set[str] = set()
+    errors: list[str] = []
+    for folder in _oeplus_folders() or ["inbox"]:
+        url = base_url.format(folder=folder)
+        last_text = ""
+        data = None
+        for params in attempts:
+            resp = http.get(url, headers=headers, params=params)
+            text = resp.text or ""
+            last_text = text[:500]
+            if resp.status_code == 200:
+                data = resp.json()
+                break
+            # 字段名不兼容时自动降级下一套参数。
+            if resp.status_code == 400 and ("Could not find a property" in text or "ParseUri" in text):
+                logger.debug("[Outlook] Outlook REST 参数不兼容，降级重试: %s", text[:220])
+                continue
             break
-        # 字段名不兼容时自动降级下一套参数。
-        if resp.status_code == 400 and ("Could not find a property" in text or "ParseUri" in text):
-            logger.debug("[Outlook] Outlook REST 参数不兼容，降级重试: %s", text[:220])
+        if data is None:
+            errors.append(f"{folder}: {last_text[:200]}")
             continue
-        raise OutlookClientError(f"Outlook REST messages HTTP {resp.status_code}: {text[:500]}")
-    if data is None:
-        raise OutlookClientError(f"Outlook REST messages 失败: {last_text}")
-    rows = data.get("value") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
-        raise OutlookClientError(f"Outlook REST 响应缺少 value: {str(data)[:300]}")
-    out = []
-    for m in rows:
-        if not isinstance(m, dict):
+        rows = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            errors.append(f"{folder}: 响应缺少 value")
             continue
-        # Outlook REST 字段转 Graph 风格；不同版本字段大小写不同。
-        from_obj = m.get("From") or m.get("from") if isinstance(m.get("From") or m.get("from"), dict) else {}
-        email_addr = from_obj.get("EmailAddress") or from_obj.get("emailAddress") if isinstance(from_obj, dict) else {}
-        if not isinstance(email_addr, dict):
-            email_addr = {}
-        body_obj = m.get("Body") or m.get("body") if isinstance(m.get("Body") or m.get("body"), dict) else {}
-        received = m.get("ReceivedDateTime") or m.get("DateTimeReceived") or m.get("receivedDateTime") or ""
-        out.append({
-            "_fetch_source": "outlook_rest",
-            "id": m.get("Id") or m.get("id") or "",
-            "subject": m.get("Subject") or m.get("subject") or "",
-            "from": {"emailAddress": {"address": email_addr.get("Address") or email_addr.get("address") or "", "name": email_addr.get("Name") or email_addr.get("name") or ""}},
-            "fromEmail": email_addr.get("Address") or email_addr.get("address") or "",
-            "fromName": email_addr.get("Name") or email_addr.get("name") or "",
-            "receivedDateTime": received,
-            "date": received,
-            "bodyPreview": m.get("BodyPreview") or m.get("bodyPreview") or "",
-            "content": body_obj.get("Content") or body_obj.get("content") or "",
-            "body": body_obj.get("Content") or body_obj.get("content") or "",
-            "html": body_obj.get("Content") or body_obj.get("content") or "",
-        })
-    logger.debug(f"[Outlook] Outlook REST 直连拿到 {len(out)} 封邮件")
+
+        for m in rows:
+            if not isinstance(m, dict):
+                continue
+            mail_id = str(m.get("Id") or m.get("id") or "")
+            dedup_key = mail_id or f"{m.get('ReceivedDateTime')}|{str(m.get('Subject') or '')[:60]}"
+            if dedup_key in seen_ids:
+                continue
+            seen_ids.add(dedup_key)
+            # Outlook REST 字段转 Graph 风格；不同版本字段大小写不同。
+            from_obj = m.get("From") or m.get("from") if isinstance(m.get("From") or m.get("from"), dict) else {}
+            email_addr = from_obj.get("EmailAddress") or from_obj.get("emailAddress") if isinstance(from_obj, dict) else {}
+            if not isinstance(email_addr, dict):
+                email_addr = {}
+            body_obj = m.get("Body") or m.get("body") if isinstance(m.get("Body") or m.get("body"), dict) else {}
+            received = m.get("ReceivedDateTime") or m.get("DateTimeReceived") or m.get("receivedDateTime") or ""
+            out.append({
+                "_fetch_source": "outlook_rest",
+                "_fetch_folder": folder,
+                "id": mail_id,
+                "subject": m.get("Subject") or m.get("subject") or "",
+                "from": {"emailAddress": {"address": email_addr.get("Address") or email_addr.get("address") or "", "name": email_addr.get("Name") or email_addr.get("name") or ""}},
+                "fromEmail": email_addr.get("Address") or email_addr.get("address") or "",
+                "fromName": email_addr.get("Name") or email_addr.get("name") or "",
+                "receivedDateTime": received,
+                "date": received,
+                "bodyPreview": m.get("BodyPreview") or m.get("bodyPreview") or "",
+                "content": body_obj.get("Content") or body_obj.get("content") or "",
+                "body": body_obj.get("Content") or body_obj.get("content") or "",
+                "html": body_obj.get("Content") or body_obj.get("content") or "",
+            })
+
+    if not out and errors:
+        raise OutlookClientError(f"Outlook REST messages 全部失败: {'; '.join(errors)[:400]}")
+    logger.debug(f"[Outlook] Outlook REST 直连拿到 {len(out)} 封邮件，文件夹={_oeplus_folders()}")
     return out
 
 
+def _imap_folder_candidates() -> list[str]:
+    """IMAP 侧的文件夹名。Outlook 的垃圾邮件箱在 IMAP 里叫 Junk。"""
+    mapping = {
+        "inbox": "INBOX",
+        "junkemail": "Junk",
+        "junk": "Junk",
+        "deleteditems": "Deleted Items",
+        "deleted": "Deleted Items",
+    }
+    names: list[str] = []
+    for folder in _oeplus_folders():
+        name = mapping.get(str(folder or "").strip().lower())
+        if name and name not in names:
+            names.append(name)
+    return names or ["INBOX"]
+
+
 def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
-    """本地 IMAP XOAUTH2 读取 Outlook Inbox 最新邮件。"""
+    """本地 IMAP XOAUTH2 读取 Outlook 最新邮件（收件箱 + 垃圾邮件箱）。"""
     http = _ms_http()
     mail: imaplib.IMAP4_SSL | None = None
     try:
@@ -806,37 +887,54 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
         auth_string = f"user={account.email}\x01auth=Bearer {token}\x01\x01"
         mail = imaplib.IMAP4_SSL("outlook.office365.com", 993)
         mail.authenticate("XOAUTH2", lambda _challenge: auth_string.encode("utf-8"))
-        status, _data = mail.select("INBOX")
-        if status != "OK":
-            raise OutlookClientError(f"IMAP select INBOX 失败: {status}")
 
-        status, msg_ids = mail.search(None, "ALL")
-        if status != "OK":
-            raise OutlookClientError(f"IMAP search 失败: {status}")
-        ids = msg_ids[0].split() if msg_ids and msg_ids[0] else []
-        if not ids:
-            logger.debug("[Outlook] 本地 IMAP 收件箱为空")
-            return []
-
-        out = []
-        for mid in ids[-20:]:
-            status, data = mail.fetch(mid, "(RFC822)")
-            if status != "OK" or not data:
+        out: list[dict] = []
+        seen_ids: set[str] = set()
+        selected_any = False
+        for folder_name in _imap_folder_candidates():
+            status, _data = mail.select(f'"{folder_name}"')
+            if status != "OK":
+                logger.debug("[Outlook] IMAP select %s 失败: %s", folder_name, status)
                 continue
-            try:
-                raw = data[0][1]
-                if not isinstance(raw, (bytes, bytearray)):
+            selected_any = True
+
+            status, msg_ids = mail.search(None, "ALL")
+            if status != "OK":
+                logger.debug("[Outlook] IMAP search %s 失败: %s", folder_name, status)
+                continue
+            ids = msg_ids[0].split() if msg_ids and msg_ids[0] else []
+            if not ids:
+                continue
+
+            for mid in ids[-20:]:
+                status, data = mail.fetch(mid, "(RFC822)")
+                if status != "OK" or not data:
                     continue
-                msg = email_lib.message_from_bytes(raw)
-                item = _imap_msg_to_dict(msg)
-                item["_fetch_source"] = "imap_new" if token_source == "live_imap_new" else "imap_entra_outlook"
-                out.append(item)
-            except Exception as exc:
-                logger.debug("[Outlook] 本地 IMAP 解析邮件失败 mid=%s: %s", mid, exc)
+                try:
+                    raw = data[0][1]
+                    if not isinstance(raw, (bytes, bytearray)):
+                        continue
+                    # 跨文件夹去重：同一封邮件可能同时出现在收件箱与垃圾箱
+                    dedup_key = hashlib.sha1(bytes(raw[:2048])).hexdigest()
+                    if dedup_key in seen_ids:
+                        continue
+                    seen_ids.add(dedup_key)
+                    msg = email_lib.message_from_bytes(raw)
+                    item = _imap_msg_to_dict(msg)
+                    item["_fetch_source"] = "imap_new" if token_source == "live_imap_new" else "imap_entra_outlook"
+                    item["_fetch_folder"] = folder_name
+                    out.append(item)
+                except Exception as exc:
+                    logger.debug("[Outlook] 本地 IMAP 解析邮件失败 mid=%s: %s", mid, exc)
+
+        if not selected_any:
+            raise OutlookClientError("IMAP 没有任何文件夹可选中")
+
         if token_source == "live_imap_new":
-            logger.info("[Outlook] 本地 IMAP(New) 直连拿到 %s 封邮件", len(out))
+            logger.info("[Outlook] 本地 IMAP(New) 直连拿到 %s 封邮件，文件夹=%s", len(out), _imap_folder_candidates())
         else:
-            logger.info("[Outlook] 本地 IMAP 直连拿到 %s 封邮件 token_source=%s", len(out), token_source)
+            logger.info("[Outlook] 本地 IMAP 直连拿到 %s 封邮件 token_source=%s 文件夹=%s",
+                        len(out), token_source, _imap_folder_candidates())
         return out
     except Exception as exc:
         logger.warning("[Outlook] 本地 IMAP 直连失败: %s: %s", type(exc).__name__, exc)
@@ -947,6 +1045,154 @@ def _fetch_via(session: CurlSession, protocol: str, account: OutlookAccount) -> 
 # 看到更晚的就重置 settle 计时；连续无新邮件 settle 秒后才返回。
 
 
+def _check_job_stop() -> None:
+    """让长轮询能响应 WebUI 的停止按钮；非任务线程里调用是安全的空操作。"""
+    try:
+        from core.registration_service import check_stop_requested
+    except Exception:
+        return
+    check_stop_requested()
+
+
+# ============================================================
+# outlook-email-plus 外部池：优先取码通道
+# ============================================================
+# 本地邮箱池里的 refresh_token 可能整体过期（AADSTS70000），而
+# outlook-email-plus 会持续刷新并维护同一批账号。这里先问它要邮件，
+# 拿不到再回退 Graph/IMAP 直连，避免"邮件已在但取不到"。
+
+def _oeplus_enabled() -> bool:
+    return bool(getattr(_email_cfg, "OEPLUS_API_ENABLED", False))
+
+
+def _email_is_outlook_source(email: str) -> bool:
+    """判断邮箱是否来自 Outlook 池。
+
+    注册账号里保存的 email_source 是权威值；没有记录时，退回到"池里有没有
+    这条记录"和域名判断。
+    """
+    target = str(email or "").strip().lower()
+    if not target:
+        return False
+    try:
+        from core.db import get_account_by_email, get_outlook_by_email
+    except Exception:
+        return target.endswith(("@outlook.com", "@hotmail.com", "@live.com"))
+
+    registered = get_account_by_email(email) or {}
+    source = str(registered.get("email_source") or "").strip().lower()
+    if source:
+        first = source.replace(";", ",").replace("|", ",").split(",", 1)[0].strip()
+        return first == "outlook"
+
+    if get_outlook_by_email(email):
+        return True
+
+    return target.endswith(("@outlook.com", "@hotmail.com", "@live.com"))
+
+
+def _oeplus_normalize(item: dict) -> dict:
+    """把 outlook-email-plus 的邮件结构映射成 otp_utils 认识的字段名。"""
+    out = dict(item)
+    # 发件人：from_address → from
+    if not out.get("from") and item.get("from_address"):
+        out["from"] = item["from_address"]
+    # 正文：content_preview / content / html_content → 统一塞进 text/content
+    body = (
+        item.get("content")
+        or item.get("content_preview")
+        or item.get("html_content")
+        or ""
+    )
+    if body:
+        out.setdefault("content", body)
+        out.setdefault("text", body)
+    # 时间：created_at 已是 ISO8601，_parse_email_ts 认 receivedDateTime
+    if not out.get("receivedDateTime") and item.get("created_at"):
+        out["receivedDateTime"] = item["created_at"]
+    out["_fetch_source"] = "oeplus"
+    return out
+
+
+def _oeplus_folders() -> list[str]:
+    """要检索的邮件文件夹。验证码常被投进垃圾邮件，默认同时查收件箱与垃圾箱。"""
+    raw = getattr(_email_cfg, "OEPLUS_FOLDERS", None)
+    if isinstance(raw, (list, tuple)) and raw:
+        folders = [str(f or "").strip().lower() for f in raw if str(f or "").strip()]
+    else:
+        text = str(raw or "inbox,junkemail")
+        folders = [f.strip().lower() for f in text.split(",") if f.strip()]
+    return folders or ["inbox"]
+
+
+def _oeplus_fetch_folder(base: str, key: str, email: str, folder: str, timeout: int) -> list[dict]:
+    """拉取单个文件夹的邮件；失败返回空列表，不影响其它文件夹。"""
+    params = {
+        "email": email,
+        "since_minutes": int(getattr(_email_cfg, "OEPLUS_SINCE_MINUTES", 60) or 60),
+        "folder": folder,
+    }
+    try:
+        resp = CurlSession().get(
+            f"{base}/api/external/messages",
+            params=params,
+            headers={"X-API-Key": key},
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(f"[OEPLUS] {folder} 请求失败: {type(exc).__name__}: {str(exc)[:160]}")
+        return []
+
+    if resp.status_code != 200:
+        logger.warning(f"[OEPLUS] {folder} HTTP {resp.status_code}: {str(resp.text)[:160]}")
+        return []
+
+    try:
+        payload = resp.json()
+    except Exception:
+        logger.warning(f"[OEPLUS] {folder} 响应不是 JSON")
+        return []
+
+    emails = ((payload or {}).get("data") or {}).get("emails") or []
+    if not isinstance(emails, list):
+        logger.warning(f"[OEPLUS] {folder} emails 字段结构异常")
+        return []
+    return [e for e in emails if isinstance(e, dict)]
+
+
+def _fetch_via_oeplus(account: OutlookAccount) -> list[dict]:
+    """向 outlook-email-plus 拉取该邮箱近期邮件；失败返回空列表（交给下游回退）。
+
+    会遍历配置的文件夹（默认 inbox + junkemail）并合并去重——OpenAI 的验证码
+    邮件有时会被判为垃圾邮件，只查收件箱会漏掉。
+    """
+    if not _oeplus_enabled():
+        return []
+    base = str(getattr(_email_cfg, "OEPLUS_API_BASE", "") or "").rstrip("/")
+    key = str(getattr(_email_cfg, "OEPLUS_API_KEY", "") or "")
+    if not base or not key:
+        return []
+
+    timeout = int(getattr(_email_cfg, "OEPLUS_TIMEOUT", 20) or 20)
+    merged: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for folder in _oeplus_folders():
+        for item in _oeplus_fetch_folder(base, key, account.email, folder, timeout):
+            # 同一封邮件可能出现在多个文件夹，按 id 去重（无 id 时退化到主题+时间）
+            mail_id = str(item.get("id") or item.get("message_id") or "")
+            dedup_key = mail_id or f"{item.get('created_at')}|{str(item.get('subject') or '')[:60]}"
+            if dedup_key in seen_ids:
+                continue
+            seen_ids.add(dedup_key)
+            normalized = _oeplus_normalize(item)
+            normalized["_fetch_folder"] = folder
+            merged.append(normalized)
+
+    logger.debug(f"[OEPLUS] {account.email} 共拿到 {len(merged)} 封邮件，文件夹={_oeplus_folders()}")
+    return merged
+
+
 def fetch_otp_with_account(
     account: OutlookAccount,
     after_ts: float | None = None,
@@ -970,6 +1216,40 @@ def fetch_otp_with_account(
         subject_excludes=subject_excludes,
         settle_seconds=settle_seconds,
     )
+
+
+def _record_last_otp(email: str, otp: str, subject: str | None) -> None:
+    """记录最近一次取到的 OTP 及其邮件主题。
+
+    fetch_latest_otp 只返回验证码字符串，调用方拿不到主题。但主题能区分
+    “注册验证码”（verification code）与“登录码”（login code）——后者说明该
+    邮箱已经是 OpenAI 老账号，注册流程注定失败，应当早退而不是耗到超时。
+    """
+    _LAST_OTP_META["email"] = str(email or "").strip().lower()
+    _LAST_OTP_META["otp"] = str(otp or "")
+    _LAST_OTP_META["subject"] = str(subject or "")
+    _LAST_OTP_META["ts"] = time.time()
+
+
+def last_otp_subject(email: str) -> str:
+    """返回该邮箱最近一次取码命中的邮件主题；无记录或非本次邮箱时返回空串。"""
+    if _LAST_OTP_META.get("email") != str(email or "").strip().lower():
+        return ""
+    return str(_LAST_OTP_META.get("subject") or "")
+
+
+def last_otp_looks_like_login_code(email: str) -> bool:
+    """判断最近一次取码命中的是不是“登录码”而非“注册验证码”。
+
+    OpenAI 给已存在账号发的是 login code。注册流程拿到这种码提交必然报错，
+    据此可以提前判定这个邮箱已经注册过。
+    """
+    subject = last_otp_subject(email).lower()
+    if not subject:
+        return False
+    if "login code" in subject or "sign in" in subject or "登录码" in subject:
+        return True
+    return False
 
 
 def fetch_latest_otp(
@@ -998,7 +1278,13 @@ def fetch_latest_otp(
     """
     account = get_account_context(email)
     if account is None:
-        raise OutlookClientError(f"未找到 {email} 的账号上下文，无法取 OTP")
+        # 仅当邮箱确实属于 Outlook 来源时才用 oeplus 兜底，
+        # 避免把 Remail/QQ 等其它来源的取码错误地路由到 Outlook 池。
+        if _oeplus_enabled() and _email_is_outlook_source(email):
+            account = OutlookAccount(email=str(email or "").strip(), password="", client_id="", refresh_token="")
+            logger.info(f"[Outlook] {email} 本地凭据不可用，改用 outlook-email-plus 取码")
+        else:
+            raise OutlookClientError(f"未找到 {email} 的账号上下文，无法取 OTP")
 
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
@@ -1020,14 +1306,42 @@ def fetch_latest_otp(
     last_diag_log = 0.0
 
     while time.time() < deadline:
+        # 用户可能在长轮询期间点了停止，这里必须能立刻退出。
+        _check_job_stop()
         # 每轮都重新拉，因为可能有新邮件，也可能旧邮件因延迟才出现
         all_candidates: list[tuple[str, dict, float, str]] = []
-        for protocol in ("graph", "imap"):
-            emails = _fetch_via(session, protocol, account)
-            for item in emails:
-                ts = _parse_email_ts(item) or 0.0
-                source = str(item.get("_fetch_source") or protocol) if isinstance(item, dict) else protocol
-                all_candidates.append((protocol, item, ts, source))
+        # outlook-email-plus 优先：它用自己的凭据读信，能绕开本地 refresh_token 过期。
+        oeplus_emails = _fetch_via_oeplus(account)
+        for item in oeplus_emails:
+            ts = _parse_email_ts(item) or 0.0
+            source = str(item.get("_fetch_source") or "oeplus")
+            all_candidates.append(("oeplus", item, ts, source))
+        # oeplus 已拿到邮件时不再打直连：本地凭据若已失效，直连每轮都会白等并刷错误日志。
+        if not oeplus_emails:
+            for protocol in ("graph", "imap"):
+                # 本地凭据可能整体过期；此时直连必失败，但不能影响整体轮询。
+                try:
+                    emails = _fetch_via(session, protocol, account)
+                except Exception as exc:
+                    logger.debug("[Outlook] %s 直连跳过: %s", protocol, str(exc)[:160])
+                    continue
+                for item in emails:
+                    ts = _parse_email_ts(item) or 0.0
+                    source = str(item.get("_fetch_source") or protocol) if isinstance(item, dict) else protocol
+                    all_candidates.append((protocol, item, ts, source))
+
+        # 同一封邮件可能同时来自 oeplus 和直连，按 id/时间戳去重，oeplus 优先
+        deduped: list[tuple[str, dict, float, str]] = []
+        seen_keys: set[str] = set()
+        for entry in all_candidates:
+            protocol, item, ts, source = entry
+            item_id = str(item.get("id") or item.get("message_id") or "")
+            dedup_key = item_id or f"{ts}|{str(item.get('subject') or '')[:60]}"
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            deduped.append(entry)
+        all_candidates = deduped
 
         # 按时间降序，最新的在前
         all_candidates.sort(key=lambda x: x[2], reverse=True)
@@ -1096,6 +1410,7 @@ def fetch_latest_otp(
                 f"[Outlook] settle 完成，返回 OTP={best_otp}, source={best_source or best_protocol}, protocol={best_protocol}, "
                 f"subject={best_subject!r}"
             )
+            _record_last_otp(email, best_otp, best_subject)
             return best_otp
 
         remaining = int(deadline - now)
@@ -1115,6 +1430,7 @@ def fetch_latest_otp(
         logger.warning(
             f"[Outlook] 总超时但已有候选，返回 OTP={best_otp}, source={best_source or best_protocol} (subject={best_subject!r})"
         )
+        _record_last_otp(email, best_otp, best_subject)
         return best_otp
 
     raise OutlookClientError(

@@ -732,15 +732,32 @@ def _submit_cpa_callback(callback_url: str) -> dict:
 # ============================================================
 
 def _is_redirect_uri(location: str) -> bool:
-    """判断 Location 是否指向注册的 redirect_uri（localhost:1455/auth/callback）。"""
+    """判断 Location 是否指向当前配置的 redirect_uri。
+
+    支持两类回调，取决于用的是哪个 client：
+      - Codex CLI client (app_EMo...)  -> http://localhost:1455/auth/callback
+      - Platform client   (app_2SK...) -> https://platform.openai.com/auth/callback
+
+    两者都以 /auth/callback 结尾，这里按 host 分别放行，保证切换 client 时
+    不必再改判定逻辑。
+    """
     try:
         parsed = urlparse(location)
     except Exception:
         return False
-    return parsed.scheme in ("http", "https") and \
-        parsed.hostname in ("localhost", "127.0.0.1") and \
-        parsed.port == 1455 and \
-        parsed.path == "/auth/callback"
+    if parsed.scheme not in ("http", "https"):
+        return False
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/auth/callback"):
+        return False
+    host = (parsed.hostname or "").lower()
+    # Codex CLI 的本地回调
+    if host in ("localhost", "127.0.0.1") and parsed.port == 1455:
+        return True
+    # platform.openai.com 的远程回调（chatgpt2api 用的 platform client）
+    if host in ("platform.openai.com", "chatgpt.com", "auth.openai.com"):
+        return True
+    return False
 
 
 def _extract_code(location: str, state: str) -> str:

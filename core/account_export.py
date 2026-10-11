@@ -725,6 +725,38 @@ def save_account_data(
     )
     logger.info("[Save] 账号及凭证已保存到 SQLite, id=%s, email=%s", row_id, email)
 
+    try:
+        from core.chatgpt2api_sync import maybe_push_registered_account
+
+        gpt_password = str(
+            extra.get("registration_password")
+            or extra.get("password")
+            or ""
+        ).strip()
+        codex_data = extra.get("codex") if isinstance(extra.get("codex"), dict) else {}
+        openai_refresh_token = str(
+            codex_data.get("refresh_token")
+            or extra.get("refresh_token")
+            or ""
+        ).strip()
+
+        maybe_push_registered_account(
+            email=email,
+            access_token=access_token,
+            proxy_used=proxy_used,
+            account_id=row_id,
+            password=gpt_password,
+            refresh_token=openai_refresh_token,
+            totp_secret=totp_secret,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[chatgpt2api] 注册后自动同步异常（不影响注册结果）: %s, %s: %s",
+            email,
+            type(exc).__name__,
+            str(exc)[:180],
+        )
+
     auto_twofa = False
     try:
         from config import twofa as _twofa_cfg

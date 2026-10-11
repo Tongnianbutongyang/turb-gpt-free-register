@@ -1235,6 +1235,19 @@ def _clear_otp_inputs(driver) -> None:
         pass
 
 
+def _last_otp_is_login_code(email: str) -> bool:
+    """判断最近一次取码命中的是否“登录码”。
+
+    走 Outlook/oeplus 通道时，邮件主题能区分注册验证码与登录码。其它来源
+    （gptmail/cloudflare 等）没有该元信息，一律返回 False，不影响原行为。
+    """
+    try:
+        from core import outlook_client as _oc
+        return bool(_oc.last_otp_looks_like_login_code(email))
+    except Exception:
+        return False
+
+
 def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
     """点击重新发送邮箱验证码。优先按 DOM 属性识别，文本仅兜底。"""
     end = time.time() + timeout
@@ -1259,7 +1272,7 @@ def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
             return candidates.find(el => enabled(el) && /resend|send\s+(?:a\s+)?new\s+code|send\s+again|重新发送|重新发送电子邮件|重发|再次发送|再送信|新しい|届かない/.test((el.innerText || el.textContent || '').toLowerCase())) || null;
             """)
             if btn:
-                text = str(btn.text or btn.get_attribute('value') or btn.get_attribute('data-dd-action-name') or '').strip()
+                text = str(getattr(btn, "text", None) or btn.get_attribute('value') or btn.get_attribute('data-dd-action-name') or '').strip()
                 _human_click(driver, btn, label="resend_otp")
                 logger.info("%s[OTP] 已点击重新发送验证码按钮：%s", _log_prefix(driver), text or '-')
                 time.sleep(random.uniform(1.1, 2.4) if _browser_actions_enabled() else 1.5)
@@ -1815,18 +1828,14 @@ def _click_continue_with_password_if_present(driver) -> dict:
         const btn = candidates.find(isPasswordCreate);
         if (!btn) return {ok:false, reason:'missing_continue_with_password'};
         btn.scrollIntoView({block:'center'});
+        btn.click();
         return {
           ok:true,
-          reason:'continue_with_password_target',
-          button: btn,
+          reason:'clicked_continue_with_password',
           href: btn.getAttribute('href') || '',
           text: (btn.textContent || '').trim().slice(0, 80)
         };
         """) or {"ok": False, "reason": "empty_result"}
-        if result.get("ok") and result.get("button"):
-            _human_click(driver, result.get("button"), label="continue_with_password")
-            result["reason"] = "clicked_continue_with_password"
-            result.pop("button", None)
         return result
     except Exception as exc:
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
@@ -2474,13 +2483,36 @@ def run_roxy_registration(
             _traffic_checkpoint()
             if outcome == 'accepted':
                 break
+            # 提交被拒且命中的是“登录码”：说明该邮箱已存在 OpenAI 账号，
+            # OpenAI 把它当登录而非注册，重发多少次都不会变成注册验证码。
+            # 立即失败并标注原因，避免白等 3 轮 ~180 秒。
+            if _last_otp_is_login_code(email):
+                raise RuntimeError(
+                    f"该邮箱已是 OpenAI 老账号（收到的邮件主题为登录码而非注册验证码），"
+                    f"注册流程无法继续，请从邮箱池剔除该账号：{email}"
+                )
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
             logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新发送并重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
+            # 注意：OpenAI 重发时常常复用同一封邮件（时间戳不变），把 after_ts 设为
+            # 当前时刻会让下一轮把重发的邮件当成旧邮件过滤掉，从而死等到超时。
+            # 与其静默重置时间戳，不如在下一轮取码失败时走宽松兜底（after_ts=0.0）。
             otp_after_ts = time.time()
             _click_resend_email_otp(driver, timeout=25)
             _traffic_checkpoint()
             human_delay("api")
+            # 重发后先宽松尝试一次：若重发的邮件时间戳未更新，也能立刻取到并重试提交。
+            try:
+                resent_otp = wait_for_otp(email, after_ts=0.0, max_wait=20, poll_interval=3)
+            except Exception:
+                resent_otp = None
+            if resent_otp and resent_otp != current_otp:
+                logger.info("[Roxy注册][OTP] 重发后宽松取到新验证码，直接重试提交：%s", resent_otp)
+                current_otp = resent_otp
+                continue
+            if resent_otp:
+                # 宽松取到的还是同一个码：说明重发邮件尚未到达，交给下一轮正常等待。
+                logger.info("[Roxy注册][OTP] 重发后仍是最新一封验证码（%s），下一轮继续等待新邮件", resent_otp)
             current_otp = None
 
         # about-you / profile 信息页：必须完成或确认已有登录态，不能静默跳过。
